@@ -1,10 +1,11 @@
 import requests
 import json
 import smtplib
+import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from openai import OpenAI
 from datetime import datetime
+import google.generativeai as genai # <-- 1. 引入 Gemini 函式庫
 
 # 載入 config.json
 with open("config.json", "r", encoding="utf-8") as f:
@@ -18,11 +19,15 @@ SMTP_PORT = config["email"]["smtp_port"]
 
 KEYWORDS = config["keywords"]
 
-# 初始化 OpenAI
-client = OpenAI()
+# --- Gemini AI 初始化 ---
+# 2. 從環境變數設定您的 Google API 金鑰
+# 請確認您已經設定了 GOOGLE_API_KEY 環境變數
+try:
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+except TypeError:
+    print("錯誤：請先設定 GOOGLE_API_KEY 環境變數。")
+    exit()
 
-# 設定 OpenAI API Key
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # PubMed API base
 PUBMED_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
@@ -65,62 +70,96 @@ def fetch_abstract(pmid):
         "abstract": abstract
     }
 
+# ------------------- 函式修改重點 -------------------
 def summarize_papers(papers, keyword):
-    """用 GPT 摘要 + 結構化 JSON"""
+    """用 Gemini AI 摘要 + 結構化 JSON"""
+    # 3. 選擇要使用的 Gemini 模型
+    model = genai.GenerativeModel('gemini-1.5-flash-latest') # 速度快，CP值高
+    # model = genai.GenerativeModel('gemini-1.5-pro-latest') # 能力更強
+
     summaries = []
     for paper in papers:
         prompt = f"""
-你是一個醫學文獻解析助手。請將以下 PubMed 論文內容整理成 JSON。
-欄位包括：
-- pmid, title, authors[], journal, year, doi, abstract
-- summary (用 3–5 句整理研究背景與主要發現)
-- study_design {{
-    inclusion_criteria[],
-    primary_outcome {{ name, result }},
-    secondary_outcomes [{{ name, result }}],
-    subgroup_analysis [{{ subgroup, result }}]
+你是一個專業的醫學文獻解析AI助手。請將以下提供的 PubMed 論文內容，嚴格按照指定的 JSON 格式進行整理和輸出。
+
+指定的 JSON 格式欄位包括：
+- pmid: string
+- title: string
+- authors: string[]
+- journal: string
+- year: string
+- doi: string
+- abstract: string
+- summary: string (請用 3–5 句流暢的中文，總結研究的背景、方法與主要發現)
+- study_design: {{
+    "inclusion_criteria": string[],
+    "primary_outcome": {{ "name": string, "result": string }},
+    "secondary_outcomes": {{ "name": string, "result": string }}[],
+    "subgroup_analysis": {{ "subgroup": string, "result": string }}[]
 }}
-- conclusion
+- conclusion: string (論文的主要結論)
 
 規則：
-1. 結果數據請包含數值 (HR, OR, CI, p-value)，若文中未提及請填 "not reported"。
-2. 請只輸出 JSON，不要額外文字。
+1.  所有欄位都必須存在，如果論文摘要中沒有提到相關資訊，請在對應的 string 類型欄位中填入 "Not reported" 或在 array 類型欄位中填入空陣列 `[]`。
+2.  在 "result" 欄位中，請盡可能包含具體的數據，例如：風險比 (HR)、勝算比 (OR)、信賴區間 (CI)、p-value 等。若文中未提及具體數值，請填 "Not reported"。
+3.  最終輸出**只能是**一個完整的 JSON 物件，絕對不要在 JSON 的前後包含任何額外的文字、解釋或 markdown 標籤 (例如 ```json ... ```)。
 
 論文內容：
-{json.dumps(paper, ensure_ascii=False)}
+{json.dumps(paper, ensure_ascii=False, indent=2)}
 """
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # 可換 gpt-4.1 / gpt-4o
-            messages=[{"role": "system", "content": "你是醫學研究助手。"},
-                      {"role": "user", "content": prompt}],
-            temperature=0
-        )
+        # 4. 呼叫 Gemini API
+        response = model.generate_content(prompt)
+        
         try:
-            summary = json.loads(response.choices[0].message.content)
-        except:
-            summary = {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+            # 5. Gemini 的回覆在 .text 屬性，並先清除可能的 markdown 標籤
+            cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
+            summary = json.loads(cleaned_response)
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"PMID {paper.get('pmid', 'N/A')} 的 JSON 解析失敗: {e}")
+            summary = {"error": "JSON parsing failed", "raw": response.text}
+        
         summaries.append(summary)
+        
     return {"keyword": keyword, "papers": summaries}
+# ----------------------------------------------------
 
 def send_email(report_json):
+    """發送包含 JSON 報告的電子郵件"""
     msg = MIMEMultipart()
     msg["From"] = EMAIL_SENDER
     msg["To"] = EMAIL_RECEIVER
-    msg["Subject"] = f"最新文獻摘要報告 - {datetime.now().strftime('%Y-%m-%d')}"
+    msg["Subject"] = f"最新文獻摘要報告 (Gemini AI) - {datetime.now().strftime('%Y-%m-%d')}"
 
-    body = MIMEText(json.dumps(report_json, indent=2, ensure_ascii=False), "plain", "utf-8")
+    # 將 JSON 美化後作為郵件內容
+    body_text = json.dumps(report_json, indent=4, ensure_ascii=False)
+    body = MIMEText(body_text, "plain", "utf-8")
     msg.attach(body)
 
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        print("✅ 郵件已成功寄出！")
+    except smtplib.SMTPException as e:
+        print(f"❌ 郵件寄送失敗: {e}")
+
 
 if __name__ == "__main__":
-    keyword = input("請輸入關鍵字： ")
-    pmids = search_pubmed(keyword, retmax=10)
-    papers = [fetch_abstract(pmid) for pmid in pmids]
-    result = summarize_papers(papers, keyword)
-
-    send_email(all_reports)
-    print("📩 報告已寄出！")
+    keyword = input("請輸入要搜尋的 PubMed 關鍵字： ")
+    if not keyword:
+        print("關鍵字不得為空。")
+    else:
+        print(f"🔍 正在搜尋關鍵字 '{keyword}' 的相關文章...")
+        pmids = search_pubmed(keyword, retmax=3) # 為了測試，先設定為 3 篇
+        if not pmids:
+            print("找不到相關文獻。")
+        else:
+            print(f"📄 找到了 {len(pmids)} 篇文章，正在抓取摘要...")
+            papers = [fetch_abstract(pmid) for pmid in pmids]
+            
+            print("🤖 正在使用 Gemini AI 進行分析與摘要，請稍候...")
+            result = summarize_papers(papers, keyword)
+            
+            print("寄送報告中...")
+            send_email(result) # <-- 修正了變數名稱
