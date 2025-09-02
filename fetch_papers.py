@@ -21,46 +21,86 @@ KEYWORDS = config["keywords"]
 # 初始化 OpenAI
 client = OpenAI()
 
-def search_pubmed(query, max_results=5):
-    url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+# 設定 OpenAI API Key
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# PubMed API base
+PUBMED_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def search_pubmed(keyword, retmax=3):
+    """用 PubMed 搜尋關鍵字，回傳 PMID 清單"""
+    url = f"{PUBMED_API}esearch.fcgi"
     params = {
         "db": "pubmed",
-        "term": query,
+        "term": keyword,
         "retmode": "json",
-        "retmax": max_results,
-        "sort": "date"
+        "retmax": retmax
     }
-    response = requests.get(url, params=params)
-    data = response.json()
-    ids = data.get("esearchresult", {}).get("idlist", [])
-    
-    papers = []
-    for pmid in ids:
-        fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-        fetch_params = {
-            "db": "pubmed",
-            "id": pmid,
-            "retmode": "xml"
-        }
-        paper = requests.get(fetch_url, params=fetch_params).text
-        papers.append({"pmid": pmid, "raw": paper})
-    return papers
+    r = requests.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()
+    return data["esearchresult"]["idlist"]
+
+def fetch_abstract(pmid):
+    """抓取 PMID 的摘要與基本資訊"""
+    url = f"{PUBMED_API}esummary.fcgi"
+    params = {"db": "pubmed", "id": pmid, "retmode": "json"}
+    r = requests.get(url, params=params)
+    r.raise_for_status()
+    summary = r.json()["result"][pmid]
+
+    fetch_url = f"{PUBMED_API}efetch.fcgi"
+    params = {"db": "pubmed", "id": pmid, "retmode": "text", "rettype": "abstract"}
+    r2 = requests.get(fetch_url, params=params)
+    r2.raise_for_status()
+    abstract = r2.text
+
+    return {
+        "pmid": pmid,
+        "title": summary.get("title", ""),
+        "authors": [a["name"] for a in summary.get("authors", [])],
+        "journal": summary.get("fulljournalname", ""),
+        "year": summary.get("pubdate", "").split(" ")[0],
+        "doi": summary.get("elocationid", ""),
+        "abstract": abstract
+    }
 
 def summarize_papers(papers, keyword):
+    """用 GPT 摘要 + 結構化 JSON"""
     summaries = []
     for paper in papers:
+        prompt = f"""
+你是一個醫學文獻解析助手。請將以下 PubMed 論文內容整理成 JSON。
+欄位包括：
+- pmid, title, authors[], journal, year, doi, abstract
+- summary (用 3–5 句整理研究背景與主要發現)
+- study_design {{
+    inclusion_criteria[],
+    primary_outcome {{ name, result }},
+    secondary_outcomes [{{ name, result }}],
+    subgroup_analysis [{{ subgroup, result }}]
+}}
+- conclusion
+
+規則：
+1. 結果數據請包含數值 (HR, OR, CI, p-value)，若文中未提及請填 "not reported"。
+2. 請只輸出 JSON，不要額外文字。
+
+論文內容：
+{json.dumps(paper, ensure_ascii=False)}
+"""
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "你是一個醫學文獻摘要助手，請用 JSON 格式回覆。"},
-                {"role": "user", "content": f"請幫我摘要以下 PubMed 論文，並輸出 JSON 格式，欄位包含：title, authors, journal, year, abstract, keyword。原始內容：{paper['raw']}。Keyword={keyword}"}
-            ]
+            model="gpt-4o-mini",  # 可換 gpt-4.1 / gpt-4o
+            messages=[{"role": "system", "content": "你是醫學研究助手。"},
+                      {"role": "user", "content": prompt}],
+            temperature=0
         )
         try:
-            summaries.append(json.loads(response.choices[0].message.content))
+            summary = json.loads(response.choices[0].message.content)
         except:
-            summaries.append({"error": "無法解析摘要", "pmid": paper["pmid"]})
-    return summaries
+            summary = {"error": "JSON parsing failed", "raw": response.choices[0].message.content}
+        summaries.append(summary)
+    return {"keyword": keyword, "papers": summaries}
 
 def send_email(report_json):
     msg = MIMEMultipart()
@@ -77,11 +117,10 @@ def send_email(report_json):
         server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
 
 if __name__ == "__main__":
-    all_reports = {}
-    for kw in KEYWORDS:
-        papers = search_pubmed(kw, max_results=3)
-        summaries = summarize_papers(papers, kw)
-        all_reports[kw] = summaries
+    keyword = input("請輸入關鍵字： ")
+    pmids = search_pubmed(keyword, retmax=10)
+    papers = [fetch_abstract(pmid) for pmid in pmids]
+    result = summarize_papers(papers, keyword)
 
     send_email(all_reports)
     print("📩 報告已寄出！")
